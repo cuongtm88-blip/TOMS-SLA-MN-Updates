@@ -31,7 +31,9 @@ import TXL_Monitor_Tele_Group_All_Over10 as txl
 import credential_store
 import github_diagnostics
 import updater
-from config import APP_DATA_ENV, APP_NAME, APP_SLUG, TELEGRAM_CHAT_ENV, TELEGRAM_TOKEN_ENV, UNIT_LABEL
+import service_catalog
+import service_ui
+from config import APP_DATA_ENV, APP_NAME, APP_SLUG, SERVICE_CATALOG_API_URL, TELEGRAM_CHAT_ENV, TELEGRAM_TOKEN_ENV, UNIT_LABEL
 from version import APP_VERSION, DIAGNOSTICS_REPOSITORY, UPDATE_CHECK_INTERVAL_SECONDS
 
 
@@ -191,6 +193,7 @@ class ATSApp(tk.Tk):
         self.github_diagnostics_token = tk.StringVar(value=os.getenv("TOMS_SLA_GITHUB_DIAGNOSTICS_TOKEN", "") or credential_store.load_secret(DIAGNOSTICS_CREDENTIAL_SERVICE, DIAGNOSTICS_REPOSITORY))
         self._error_recipient_ids = saved_recipients
         self._telegram_token_for_alerts = self.telegram_token.get().strip()
+        self.service_preferences = {key: saved[key] for key in ("service_filter_mode", "selected_service_ids", "selected_service_label_ids") if key in saved}
         self.current_stage = "Khởi tạo ứng dụng"
         self.browser_context = None
         self.browser_page = None
@@ -264,6 +267,7 @@ class ATSApp(tk.Tk):
             state="disabled",
         )
         self.run_btn.pack(side="left", padx=4)
+        ttk.Button(actions, text="Dịch vụ", command=self._open_service_settings).pack(side="left", padx=4)
         ttk.Button(actions, text="Dừng", command=self.request_stop).pack(side="left", padx=4)
         ttk.Checkbutton(actions, text="Tự động cảnh báo sau", variable=self.schedule_enabled).pack(side="left", padx=(12, 4))
         ttk.Spinbox(actions, from_=1, to=10080, textvariable=self.repeat_minutes, width=6).pack(side="left")
@@ -1658,7 +1662,10 @@ class ATSApp(tk.Tk):
     def _process_and_send(self, excel):
         """Use the transferred MonitorTXL source directly on macOS/Windows."""
         self.write_log("Đang xử lý Excel bằng mã nguồn MonitorTXL...")
+        source_frame = txl.pd.read_excel(excel, dtype=object)
+        catalog = self._refresh_service_catalog(source_frame)
         frame = txl.process_bh_file(str(excel))
+        frame = self._filter_service_frame(frame, catalog)
         alert_frame = txl.get_alert_dataframe_bh(frame)
         self.write_log(
             f"Đã lọc {len(frame)} phiếu phù hợp; "
@@ -1682,6 +1689,8 @@ class ATSApp(tk.Tk):
                 f"Đã gửi Telegram cho {len(alert_frame)} phiếu từ 10 phút trở lên."
             )
         completion_frame, in_progress_frame = txl.get_operational_alert_data(str(excel))
+        completion_frame = self._filter_service_frame(completion_frame, catalog)
+        in_progress_frame = self._filter_service_frame(in_progress_frame, catalog)
         if len(completion_frame):
             txl.send_telegram_message(txl.build_completion_message(completion_frame))
             self.write_log(f"Đã gửi cảnh báo {len(completion_frame)} phiếu chưa nghiệm thu.")
@@ -1693,12 +1702,55 @@ class ATSApp(tk.Tk):
         elif len(in_progress_frame):
             self.write_log("Phiếu đang thực hiện chưa đến mốc cảnh báo 60 phút tiếp theo.")
 
+    def _open_service_settings(self):
+        client = service_catalog.ServiceCatalog(SERVICE_CATALOG_API_URL)
+        service_ui.open_service_window(self, client, self.service_preferences, self._save_service_preferences)
+
+    def _save_service_preferences(self, value):
+        self.service_preferences = value
+        _save_settings({**_load_settings(), **value})
+        self.write_log("Đã lưu lựa chọn lọc dịch vụ riêng trên máy này.")
+
+    def _refresh_service_catalog(self, source_frame):
+        client = service_catalog.ServiceCatalog(SERVICE_CATALOG_API_URL)
+        catalog = client.get()
+        if "loaihinh_tb" not in source_frame.columns:
+            raise service_catalog.CatalogError("Bảng OneBSS thiếu cột Loại hình thuê bao")
+        known = {service_catalog.service_key(x["ten_dich_vu"]) for x in catalog["services"]}
+        discovered = {}
+        for value in source_frame["loaihinh_tb"].dropna().astype(str):
+            value = value.strip()
+            if value and service_catalog.service_key(value) not in known:
+                discovered.setdefault(service_catalog.service_key(value), value)
+        if discovered:
+            added = client.sync_services(list(discovered.values()))
+            catalog = client.get()
+            names = [x["ten_dich_vu"] for x in added]
+            if names:
+                try:
+                    txl.send_telegram_message("Dịch vụ mới trên OneBSS:\n" + "\n".join("• " + html.escape(x) for x in names), bot_token=self._telegram_token_for_alerts)
+                except Exception as exc:
+                    self.write_log(f"Chưa gửi được thông báo dịch vụ mới qua Telegram: {exc}")
+                self.write_log("Đã đồng bộ dịch vụ mới: " + ", ".join(names))
+        return catalog
+
+    def _filter_service_frame(self, frame, catalog):
+        if self.service_preferences.get("service_filter_mode", "all") != "custom":
+            return frame
+        return service_catalog.filter_selected_services(frame, self.service_preferences.get("selected_service_ids", []), self.service_preferences.get("selected_service_label_ids", []), catalog)
+
 
 if __name__ == "__main__":
     # Used only by the Windows build pipeline.  This verifies that a frozen
     # EXE can load Python, Playwright and the application's imports without
     # opening a GUI or requiring OneBSS/Telegram configuration.
     if "--self-test" in sys.argv:
+        catalog = {"services": [{"service_id": "s1", "ten_dich_vu": "MetroNet FE"}],
+                   "labels": [{"label_id": "l1", "ten_nhan": "Nhánh 4"}],
+                   "links": [{"label_id": "l1", "service_id": "s1"}]}
+        sample = txl.pd.DataFrame([{"loaihinh_tb": "MetroNet FE"}, {"loaihinh_tb": "Khác"}])
+        if len(service_catalog.filter_selected_services(sample, [], ["l1"], catalog)) != 1:
+            raise SystemExit("MN service-label filtering self-test failed")
         raise SystemExit(0)
     if "--browser-self-test" in sys.argv:
         if sync_playwright is None:
